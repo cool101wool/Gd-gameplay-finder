@@ -1,376 +1,238 @@
-from flask import Flask, send_file, session, redirect, url_for, request, render_template_string
-from PIL import Image
-import io, random, os, json, base64, uuid
+from flask import Flask, send_file
+from PIL import Image, ImageDraw, ImageFont
+import io, random, os, json, base64
+import numpy as np
 
 app = Flask(__name__)
-app.secret_key = os.environ.get("SECRET_KEY", "gd-viewer-secret")
 
 # ── Constants ──────────────────────────────────────────────────────────────────
-BG_COLOR  = (0, 0x98, 0xFF, 255)   # #0098FF
-# The full canvas rendered server-side (covers the whole level extent)
-# We pad 500px on each side so the player can scroll to the edges.
-PADDING   = 500
+IMG_W, IMG_H  = 900, 600
+BG_COLOR      = (0, 0x98, 0xFF)          # #0098FF  (RGB)
+GROUND_DARKEN = 0.5                       # factor applied below y=0
+TEXT_H        = 60                        # pixel rows reserved at top for info
+LEVELS_PATH   = "levels_all.json"
 
-# ── Server-side level store (in-memory, keyed by session id) ──────────────────
-# Stores: { sid: { "objects": [...], "meta": {...}, "origin": (x, y) } }
-_level_store: dict = {}
+# ── Level loading ──────────────────────────────────────────────────────────────
 
-# ── HTML template ──────────────────────────────────────────────────────────────
-HTML = """
-<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <title>GD Level Viewer</title>
-  <style>
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body {
-      background: #1a1a2e;
-      color: #eee;
-      font-family: monospace;
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      padding: 24px;
-      gap: 14px;
-    }
-    h2 { color: #0af; }
-
-    #viewport {
-      width: 900px;
-      height: 600px;
-      max-width: 100%;
-      overflow: hidden;
-      border: 3px solid #0af;
-      position: relative;
-      cursor: grab;
-      background: #0098FF;
-    }
-    #viewport:active { cursor: grabbing; }
-    #level-img {
-      position: absolute;
-      top: 0; left: 0;
-      display: block;
-      /* transform set by JS to pan */
-    }
-
-    .info {
-      background: #0d0d1a;
-      border: 1px solid #0af;
-      padding: 14px 20px;
-      border-radius: 6px;
-      width: 900px;
-      max-width: 100%;
-      white-space: pre-wrap;
-      line-height: 1.8;
-    }
-    .label { color: #0af; }
-    .hint  { color: #555; font-size: 12px; }
-  </style>
-</head>
-<body>
-  <h2>GD Level Viewer</h2>
-  <p class="hint">Refresh the page for a new level &nbsp;·&nbsp; WASD or arrow keys to move &nbsp;·&nbsp; click-drag also works</p>
-
-  <div id="viewport">
-    <img id="level-img" src="/image" alt="level" draggable="false">
-  </div>
-
-  <div class="info">
-<span class="label">id:</span>           {{ level_id }}
-<span class="label">difficulty:</span>   {{ stars }} stars
-<span class="label">name:</span>         {{ name }}
-<span class="label">description:</span>  {{ description }}
-
-<span class="hint">Not all gd objects are included in the display</span>
-  </div>
-
-<script>
-  // Starting scroll position: centre of viewport on the focus point
-  // focus_screen_x / focus_screen_y are the pixel coords in the full image
-  // where the camera should start.
-  const FOCUS_X = {{ focus_x }};
-  const FOCUS_Y = {{ focus_y }};
-  const VP_W = 900, VP_H = 600;
-  const STEP  = 100;   // WASD move distance in pixels
-
-  const viewport = document.getElementById("viewport");
-  const img      = document.getElementById("level-img");
-
-  // panX / panY = top-left corner of the image within the viewport
-  // (negative means we've scrolled right/down into the image)
-  let panX = -(FOCUS_X - VP_W / 2);
-  let panY = -(FOCUS_Y - VP_H / 2);
-
-  function clamp(val, min, max) { return Math.max(min, Math.min(max, val)); }
-
-  function applyPan() {
-    // Once the image is loaded we know its size; before that just apply
-    const iw = img.naturalWidth  || img.width  || 9999999;
-    const ih = img.naturalHeight || img.height || 9999999;
-    panX = clamp(panX, -(iw - VP_W), 0);
-    panY = clamp(panY, -(ih - VP_H), 0);
-    img.style.transform = `translate(${panX}px, ${panY}px)`;
-  }
-
-  img.addEventListener("load", applyPan);
-  applyPan();   // also call immediately in case it's cached
-
-  // ── Keyboard ────────────────────────────────────────────────────────────────
-  document.addEventListener("keydown", function(e) {
-    switch (e.key) {
-      case "ArrowLeft":  case "a": case "A": panX += STEP; break;
-      case "ArrowRight": case "d": case "D": panX -= STEP; break;
-      case "ArrowUp":    case "w": case "W": panY += STEP; break;
-      case "ArrowDown":  case "s": case "S": panY -= STEP; break;
-      default: return;
-    }
-    e.preventDefault();
-    applyPan();
-  });
-
-  // ── Click-drag ───────────────────────────────────────────────────────────────
-  let dragging = false, dragStartX, dragStartY, panStartX, panStartY;
-
-  viewport.addEventListener("mousedown", function(e) {
-    dragging = true;
-    dragStartX = e.clientX;
-    dragStartY = e.clientY;
-    panStartX  = panX;
-    panStartY  = panY;
-  });
-  document.addEventListener("mousemove", function(e) {
-    if (!dragging) return;
-    panX = panStartX + (e.clientX - dragStartX);
-    panY = panStartY + (e.clientY - dragStartY);
-    applyPan();
-  });
-  document.addEventListener("mouseup", function() { dragging = false; });
-</script>
-</body>
-</html>
-"""
-
-# ── Level helpers ──────────────────────────────────────────────────────────────
-
-def load_levels(path="levels_all.json"):
-    with open(path, "r") as f:
+def load_levels():
+    with open(LEVELS_PATH) as f:
         return json.load(f)
 
 
-def parse_level_data(level_data_str: str) -> list[dict]:
-    segments = level_data_str.split(";")
-    objects  = []
-    for seg in segments[1:]:
+def parse_objects(level_data_str: str) -> list[dict]:
+    """Parse GD level string → list of object dicts."""
+    result = []
+    for seg in level_data_str.split(";")[1:]:   # skip colour header
         seg = seg.strip()
         if not seg:
             continue
         parts = seg.split(",")
-        obj   = {}
+        obj = {}
         for i in range(0, len(parts) - 1, 2):
             try:
                 obj[int(parts[i])] = parts[i + 1]
             except (ValueError, IndexError):
-                continue
+                pass
         if obj:
-            objects.append(obj)
-    return objects
+            result.append({
+                "id":       int(obj.get(1, 1)),
+                "x":        float(obj.get(2, 0)),
+                "y":        float(obj.get(3, 0)),
+                "flip_x":   obj.get(4) == "1",
+                "flip_y":   obj.get(5) == "1",
+                "rotation": float(obj.get(6, 0)),
+            })
+    return result
 
 
-def object_to_dict(raw: dict) -> dict:
-    return {
-        "id":       int(raw.get(1, 1)),
-        "x":        float(raw.get(2, 0)),
-        "y":        float(raw.get(3, 0)),
-        "flip_x":   raw.get(4, "0") == "1",
-        "flip_y":   raw.get(5, "0") == "1",
-        "rotation": float(raw.get(6, 0)),
-    }
-
-
-def decode_description(b64: str) -> str:
+def decode_b64(s: str) -> str:
     try:
-        padded = b64 + "=" * (-len(b64) % 4)
-        return base64.b64decode(padded).decode("utf-8", errors="replace")
+        return base64.b64decode(s + "=" * (-len(s) % 4)).decode("utf-8", errors="replace")
     except Exception:
-        return b64
-
+        return s
 
 # ── Texture cache ──────────────────────────────────────────────────────────────
 
-_texture_cache: dict[int, "Image.Image | None"] = {}
+_tex_cache: dict[int, np.ndarray | None] = {}
 
-def get_texture(obj_id: int):
-    if obj_id in _texture_cache:
-        return _texture_cache[obj_id]
+def get_texture(obj_id: int) -> np.ndarray | None:
+    """Return RGBA uint8 numpy array for the given object id, or None."""
+    if obj_id in _tex_cache:
+        return _tex_cache[obj_id]
     path = os.path.join("textures", f"{obj_id}.png")
     if os.path.exists(path):
-        tex = Image.open(path).convert("RGBA")
-        _texture_cache[obj_id] = tex
+        tex = np.array(Image.open(path).convert("RGBA"), dtype=np.uint8)
     else:
-        _texture_cache[obj_id] = None
-    return _texture_cache[obj_id]
+        tex = None
+    _tex_cache[obj_id] = tex
+    return tex
 
+# ── Rendering ──────────────────────────────────────────────────────────────────
 
-# ── Full-level render ──────────────────────────────────────────────────────────
-
-def render_full_level(objects: list[dict]) -> tuple[Image.Image, int, int]:
+def alpha_composite_onto(canvas: np.ndarray, sprite: np.ndarray, px: int, py: int):
     """
-    Render every object into one big canvas sized to fit all objects + PADDING.
-    Returns (image, origin_x, origin_y) where origin is the pixel coordinate
-    in the image that corresponds to world position (0, 0).
-    GD y-axis is upward; screen y-axis is downward.
+    Premultiplied-alpha composite sprite onto canvas (both RGBA uint8 numpy arrays).
+    Clips sprite to canvas bounds automatically.
+    """
+    ch, cw = canvas.shape[:2]
+    sh, sw = sprite.shape[:2]
+
+    # Destination rect in canvas space
+    x0c = max(px, 0);  y0c = max(py, 0)
+    x1c = min(px + sw, cw); y1c = min(py + sh, ch)
+    if x0c >= x1c or y0c >= y1c:
+        return
+
+    # Corresponding rect in sprite space
+    x0s = x0c - px;  y0s = y0c - py
+    x1s = x0s + (x1c - x0c); y1s = y0s + (y1c - y0c)
+
+    dst = canvas[y0c:y1c, x0c:x1c].astype(np.float32)
+    src = sprite[y0s:y1s, x0s:x1s].astype(np.float32)
+
+    sa = src[..., 3:4] / 255.0
+    da = dst[..., 3:4] / 255.0
+    out_a = sa + da * (1.0 - sa)
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        out_rgb = np.where(
+            out_a > 0,
+            (src[..., :3] * sa + dst[..., :3] * da * (1.0 - sa)) / out_a,
+            0.0,
+        )
+
+    result = np.empty_like(dst)
+    result[..., :3] = out_rgb
+    result[..., 3:]  = out_a * 255.0
+    canvas[y0c:y1c, x0c:x1c] = result.clip(0, 255).astype(np.uint8)
+
+
+def transform_sprite(tex: np.ndarray, flip_x: bool, flip_y: bool, rotation: float) -> np.ndarray:
+    img = Image.fromarray(tex)
+    if flip_x:
+        img = img.transpose(Image.FLIP_LEFT_RIGHT)
+    if flip_y:
+        img = img.transpose(Image.FLIP_TOP_BOTTOM)
+    if rotation:
+        img = img.rotate(-rotation, expand=True)
+    return np.array(img)
+
+
+def render(objects: list[dict], cam_x: float, cam_y: float,
+           level_id: str, name: str, stars: str, description: str) -> Image.Image:
+
+    render_h = IMG_H - TEXT_H                  # pixel rows for the level view
+    half_w   = IMG_W / 2
+    half_h   = render_h / 2
+
+    # Build canvas as numpy array (RGBA)
+    canvas = np.empty((IMG_H, IMG_W, 4), dtype=np.uint8)
+    # Top TEXT_H rows: dark background for text
+    canvas[:TEXT_H]  = (20, 20, 40, 255)
+    # Level-view rows: sky blue
+    canvas[TEXT_H:]  = (*BG_COLOR, 255)
+
+    # ground_row = canvas row that corresponds to world y=0
+    ground_row = TEXT_H + int(half_h + cam_y)   # cam_y positive → ground moves down
+
+    # Darken rows below world y=0 in the level area
+    dark_start = max(TEXT_H, ground_row)
+    if dark_start < IMG_H:
+        canvas[dark_start:, :, :3] = (canvas[dark_start:, :, :3].astype(np.float32) * GROUND_DARKEN).astype(np.uint8)
+
+    # Draw objects
+    for obj in objects:
+        tex = get_texture(obj["id"])
+        if tex is None:
+            continue
+
+        sprite = transform_sprite(tex, obj["flip_x"], obj["flip_y"], obj["rotation"])
+        sh, sw = sprite.shape[:2]
+
+        # World → screen (y inverted, offset into canvas below text bar)
+        px = int(obj["x"] - cam_x + half_w - sw / 2)
+        py = TEXT_H + int(-(obj["y"] - cam_y) + half_h - sh / 2)
+
+        # Quick cull
+        if px + sw <= 0 or px >= IMG_W:   continue
+        if py + sh <= TEXT_H or py >= IMG_H: continue
+
+        alpha_composite_onto(canvas, sprite, px, py)
+
+    img = Image.fromarray(canvas, "RGBA")
+
+    # ── Text overlay ───────────────────────────────────────────────────────────
+    draw = ImageDraw.Draw(img)
+    try:
+        font = ImageFont.truetype("arial.ttf", 14)
+    except Exception:
+        font = ImageFont.load_default()
+
+    line1 = f"id: {level_id}   difficulty: {stars}   name: {name}"
+    line2 = f"description: {description}"
+
+    draw.text((8, 6),  line1, fill=(255, 220, 80),  font=font)
+    draw.text((8, 28), line2, fill=(200, 200, 200), font=font)
+
+    return img.convert("RGB")
+
+# ── Camera clamping ────────────────────────────────────────────────────────────
+
+def clamped_camera(focus: dict, objects: list[dict]) -> tuple[float, float]:
+    """
+    Start with the focus object's position, then clamp so the viewport
+    doesn't show empty space beyond the level bounds.
+    Priority: don't clip left > don't clip bottom > don't clip right > don't clip top.
     """
     if not objects:
-        img = Image.new("RGBA", (900, 600), BG_COLOR)
-        return img, 0, 0
+        return focus["x"], focus["y"]
 
     xs = [o["x"] for o in objects]
     ys = [o["y"] for o in objects]
     min_x, max_x = min(xs), max(xs)
     min_y, max_y = min(ys), max(ys)
 
-    # Canvas size in pixels
-    canvas_w = int(max_x - min_x) + PADDING * 2 + 128   # +128 for sprite width
-    canvas_h = int(max_y - min_y) + PADDING * 2 + 128
+    render_h = IMG_H - TEXT_H
+    half_w   = IMG_W / 2
+    half_h   = render_h / 2
 
-    # Pixel coordinate of world (0, 0)
-    origin_x = int(-min_x) + PADDING
-    origin_y = int(max_y)  + PADDING   # flipped
+    cam_x = focus["x"]
+    cam_y = focus["y"]
 
-    canvas = Image.new("RGBA", (canvas_w, canvas_h), BG_COLOR)
+    # Left priority first: cam_x - half_w >= min_x  →  cam_x >= min_x + half_w
+    cam_x = max(cam_x, min_x + half_w)
+    # Then right: cam_x + half_w <= max_x  →  cam_x <= max_x - half_w
+    cam_x = min(cam_x, max_x - half_w)
 
-    for obj in objects:
-        tex = get_texture(obj["id"])
-        if tex is None:
-            continue
+    # Bottom priority first: cam_y - half_h >= min_y  →  cam_y >= min_y + half_h
+    cam_y = max(cam_y, min_y + half_h)
+    # Then top: cam_y + half_h <= max_y  →  cam_y <= max_y - half_h
+    cam_y = min(cam_y, max_y - half_h)
 
-        sprite = tex.copy()
-        if obj["flip_x"]:
-            sprite = sprite.transpose(Image.FLIP_LEFT_RIGHT)
-        if obj["flip_y"]:
-            sprite = sprite.transpose(Image.FLIP_TOP_BOTTOM)
-        if obj["rotation"] != 0:
-            sprite = sprite.rotate(-obj["rotation"], expand=True)
+    return cam_x, cam_y
 
-        sw, sh = sprite.size
-        # World → canvas pixel (y inverted)
-        px = origin_x + int(obj["x"]) - sw // 2
-        py = origin_y - int(obj["y"]) - sh // 2
+# ── Flask route ────────────────────────────────────────────────────────────────
 
-        # Clip to canvas bounds
-        if px + sw < 0 or px > canvas_w:
-            continue
-        if py + sh < 0 or py > canvas_h:
-            continue
-
-        canvas.alpha_composite(sprite, dest=(px, py))
-
-    # ── Darken everything below world y = 0 ───────────────────────────────────
-    # origin_y is the canvas row that corresponds to world y = 0.
-    # Rows with index > origin_y are below ground (GD y is upward).
-    if origin_y < canvas_h:
-        import numpy as np
-        arr = np.array(canvas, dtype=np.float32)          # H×W×4  (RGBA)
-        # Multiply RGB channels by 0.5 for all rows below the ground line.
-        # Alpha channel is left untouched.
-        arr[origin_y:, :, :3] *= 0.5
-        arr = arr.clip(0, 255).astype(np.uint8)
-        canvas = Image.fromarray(arr, "RGBA")
-
-    return canvas, origin_x, origin_y
-
-
-def flatten_to_png(img: Image.Image) -> io.BytesIO:
-    final = Image.new("RGB", img.size, (255, 255, 255))
-    final.paste(img, mask=img.split()[3])
-    buf = io.BytesIO()
-    final.save(buf, format="PNG", optimize=False)
-    buf.seek(0)
-    return buf
-
-
-# ── Session / store helpers ────────────────────────────────────────────────────
-
-def get_sid() -> str:
-    """Return existing session id or create a new one."""
-    if "sid" not in session:
-        session["sid"] = str(uuid.uuid4())
-    return session["sid"]
-
-
-def init_level():
-    sid    = get_sid()
+@app.route("/")
+def home():
     levels = load_levels()
     level  = random.choice(levels)
     meta   = level.get("metadata", {})
 
-    raw_objs = parse_level_data(level["level_data"])
-    objects  = [object_to_dict(o) for o in raw_objs]
-    focus    = random.choice(objects) if objects else {"x": 0.0, "y": 0.0}
+    objects     = parse_objects(level["level_data"])
+    focus       = random.choice(objects) if objects else {"x": 0.0, "y": 0.0}
+    cam_x, cam_y = clamped_camera(focus, objects)
 
-    _level_store[sid] = {
-        "objects":     objects,
-        "focus":       focus,
-        "level_id":    level.get("id", "?"),
-        "level_name":  meta.get("name", "Unknown"),
-        "level_stars": meta.get("stars", "?"),
-        "level_desc":  decode_description(meta.get("description", "")),
-    }
+    level_id    = meta.get("id", "?")
+    name        = meta.get("name", "Unknown")
+    stars       = meta.get("stars", "?")
+    description = decode_b64(meta.get("description", ""))
 
+    img = render(objects, cam_x, cam_y, level_id, name, stars, description)
 
-def get_store() -> dict | None:
-    return _level_store.get(session.get("sid"))
-
-
-# ── Routes ─────────────────────────────────────────────────────────────────────
-
-@app.route("/")
-def home():
-    # Always generate a fresh level on page load (refresh = new level)
-    init_level()
-    store = get_store()
-
-    # Compute where in the full image the focus object will land
-    # We need the bounding box info — easiest to do a dry-run of the origin calc
-    objects = store["objects"]
-    focus   = store["focus"]
-
-    if objects:
-        xs     = [o["x"] for o in objects]
-        ys     = [o["y"] for o in objects]
-        min_x  = min(xs)
-        max_y  = max(ys)
-        origin_x = int(-min_x) + PADDING
-        origin_y = int(max_y)  + PADDING
-        focus_screen_x = origin_x + int(focus["x"])
-        focus_screen_y = origin_y - int(focus["y"])
-    else:
-        focus_screen_x = 450
-        focus_screen_y = 300
-
-    return render_template_string(
-        HTML,
-        level_id    = store["level_id"],
-        name        = store["level_name"],
-        stars       = store["level_stars"],
-        description = store["level_desc"],
-        focus_x     = focus_screen_x,
-        focus_y     = focus_screen_y,
-    )
-
-
-@app.route("/image")
-def image():
-    store = get_store()
-    if store is None:
-        # Fallback blank image
-        img = Image.new("RGBA", (900, 600), BG_COLOR)
-        buf = flatten_to_png(img)
-        return send_file(buf, mimetype="image/png")
-
-    img, _, _ = render_full_level(store["objects"])
-    buf = flatten_to_png(img)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    buf.seek(0)
     return send_file(buf, mimetype="image/png")
 
 
