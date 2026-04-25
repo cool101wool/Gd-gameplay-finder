@@ -14,6 +14,12 @@ PADDING   = 500
 # ── Server-side level store (in-memory, keyed by session id) ──────────────────
 # Stores: { sid: { "objects": [...], "meta": {...}, "origin": (x, y) } }
 _level_store: dict = {}
+
+# ── HTML template ──────────────────────────────────────────────────────────────
+HTML = """
+<!DOCTYPE html>
+<html>
+<head>
   <meta charset="utf-8">
   <title>GD Level Viewer</title>
   <style>
